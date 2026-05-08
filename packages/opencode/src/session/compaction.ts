@@ -169,6 +169,12 @@ function splitTurn(input: {
     if (input.budget <= 0) return undefined
     if (input.turn.end - input.turn.start <= 1) return undefined
     for (let start = input.turn.start + 1; start < input.turn.end; start++) {
+      // Only split at user message boundaries. Starting a tail at an assistant
+      // message causes consecutive assistant messages after compaction
+      // ([summary, tail_assistant]), which Anthropic rejects with
+      // "tool_use ids found without tool_result blocks immediately after".
+      const msg = input.messages[start]
+      if (!msg || msg.info.role !== "user") continue
       const size = yield* input.estimate({
         messages: input.messages.slice(start, input.turn.end),
         model: input.model,
