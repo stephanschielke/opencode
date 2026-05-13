@@ -142,3 +142,66 @@ const cb = Instance.bind((err, evts) => {
 })
 nativeAddon.subscribe(dir, cb)
 ```
+
+## MCP lifecycle
+
+### `experimental.mcp_lazy` is NOT implemented
+
+The config key `experimental.mcp_lazy` in `opencode.jsonc` does **nothing**. There is no code in the repository that reads or acts on this flag. It was never implemented.
+
+### Eager spawn per-instance
+
+MCP servers are spawned eagerly when the MCP service state materializes (`src/mcp/index.ts` - state init).
+
+Key behavior at lines 524-549:
+- Iterates all entries in `config.mcp`
+- For each enabled server calls `create(key, mcp)` with `concurrency: "unbounded"`
+- Each local MCP server (`type: "local"`) spawns a new child process via `StdioClientTransport`
+- There is **no singleton/pool/reuse** across instances
+
+### Multiple instances = duplicate MCP processes
+
+Each `InstanceState` bootstrap can create its own MCP service state. If multiple instances exist (different directories, subagents, worktrees), each one independently spawns the full set of configured local MCP servers.
+
+This is visible in process trees as repeated clusters of the same MCP launcher commands under one opencode parent:
+```
+opencode-mcp-lazy-search
+├── npm exec chrome-devtools-mcp@latest ...   # batch 1
+├── uvx duckduckgo-mcp-server                  # batch 1
+├── uvx mcp-server-time                        # batch 1
+├── npm exec chrome-devtools-mcp@latest ...   # batch 2
+├── uvx duckduckgo-mcp-server                  # batch 2
+└── uvx mcp-server-time                        # batch 2
+```
+
+### Cleanup only at instance finalizer
+
+The MCP service layer registers an `addFinalizer` (lines 551-571) that:
+- Iterates all connected clients
+- For `StdioClientTransport`, gathers child PIDs via `descendants()` and sends `SIGTERM`
+- Calls `client.close()`
+
+If an instance is not disposed (crash, orphaned session, missed cleanup), these child MCP processes survive.
+
+### Preventing MCP process buildup
+
+Options (none implemented yet):
+1. **Global connection pool**: one MCP server process per config key per app runtime, shared across instances
+2. **Reference counting**: acquire on instance create, release on dispose
+3. **Idle timeout**: kill MCP processes after N seconds of no tool calls
+4. **Lazy connect**: connect on first tool call, not at state init
+
+For emergency cleanup of orphaned MCP processes (PPID=1 or parent dead):
+```
+mise run opencode:mcp:cleanup-orphans         # dry-run
+mise run opencode:mcp:cleanup-orphans kill    # SIGTERM + SIGKILL
+```
+
+### Log volume + IOWAIT correlation
+
+Large MCP process counts and `logLevel: "DEBUG"` produce enough log/traffic to spike IOWAIT under memory pressure:
+- 16MB+ log files with thousands of error/warn lines
+- Hundreds of active MCP child processes with event loops
+- Large SQLite DB (millions of session/event rows) amplifying IO churn
+
+Mitigations: disable unused MCP servers, raise log level to WARN, reduce session churn.

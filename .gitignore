@@ -24,6 +24,15 @@ target
 .scripts
 .direnv/
 
+# Agent working files
+.sisyphus/
+
+# Generated config dumps
+agents.json.txt
+
+# Local build artifacts
+.bin-vault/
+
 # Local dev files
 opencode-dev
 UPCOMING_CHANGELOG.md

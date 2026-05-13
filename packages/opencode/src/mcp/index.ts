@@ -575,12 +575,21 @@ export const layer = Layer.effect(
       }),
     )
 
-    function closeClient(s: State, name: string) {
+    const closeClient = Effect.fnUntraced(function* (s: State, name: string) {
       const client = s.clients[name]
       delete s.defs[name]
-      if (!client) return Effect.void
-      return Effect.tryPromise(() => client.close()).pipe(Effect.ignore)
-    }
+      if (!client) return
+      const pid = client.transport instanceof StdioClientTransport ? client.transport.pid : null
+      if (typeof pid === "number") {
+        const pids = yield* descendants(pid)
+        for (const dpid of pids) {
+          try {
+            process.kill(dpid, "SIGTERM")
+          } catch {}
+        }
+      }
+      yield* Effect.tryPromise(() => client.close()).pipe(Effect.ignore)
+    })
 
     const storeClient = Effect.fnUntraced(function* (
       s: State,
