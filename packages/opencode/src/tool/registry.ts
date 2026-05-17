@@ -389,8 +389,7 @@ export const layer: Layer.Layer<
 export const defaultLayer = Layer.suspend(() =>
   layer
     .pipe(
-      Layer.provide(Config.defaultLayer),
-      Layer.provide(MCP.defaultLayer),
+      Layer.provide(Layer.mergeAll(Config.defaultLayer, MCP.defaultLayer)),
       Layer.provide(Plugin.defaultLayer),
       Layer.provide(Question.defaultLayer),
       Layer.provide(Todo.defaultLayer),

@@ -243,9 +243,19 @@ try {
   }
   process.exitCode = 1
 } finally {
-  // Some subprocesses don't react properly to SIGTERM and similar signals.
-  // Most notably, some docker-container-based MCP servers don't handle such signals unless
-  // run using `docker run --init`.
-  // Explicitly exit to avoid any hanging subprocesses.
+  // Await Effect runtime disposal so that MCP child process finalizers run
+  // before we exit. Without this, process.exit() fires while finalizers are
+  // still pending and MCP stdio children (npm exec, uv tool uvx, etc.) are
+  // left orphaned. Cap at 5 s so a stuck finalizer never hangs the process.
+  try {
+    const { AppRuntime } = await import("./effect/app-runtime")
+    await Promise.race([
+      AppRuntime.dispose(),
+      new Promise<void>((resolve) => setTimeout(resolve, 5_000)),
+    ])
+  } catch {}
+  // Force-exit as a last resort in case hanging subprocesses prevent Node
+  // from draining its event loop (e.g. docker-container MCP servers that
+  // ignore SIGTERM and never close their stdio pipes).
   process.exit()
 }

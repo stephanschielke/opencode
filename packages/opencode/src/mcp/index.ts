@@ -27,14 +27,21 @@ import { BusEvent } from "../bus/bus-event"
 import { Bus } from "@/bus"
 import { TuiEvent } from "@/cli/cmd/tui/event"
 import open from "open"
-import { Effect, Exit, Layer, Option, Context, Schema, Stream } from "effect"
+import { Effect, Exit, Layer, Option, Context, Schema } from "effect"
 import { EffectBridge } from "@/effect/bridge"
 import { InstanceState } from "@/effect/instance-state"
-import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
-import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 
 const log = Log.create({ service: "mcp" })
 const DEFAULT_TIMEOUT = 30_000
+
+const localMcpPids = new Set<number>()
+
+process.on("exit", () => {
+  for (const pid of localMcpPids) {
+    try { process.kill(-pid, "SIGKILL") } catch {}
+    try { process.kill(pid, "SIGKILL") } catch {}
+  }
+})
 
 const TolerantListToolsResultSchema = ListToolsResultSchema.extend({
   tools: ToolSchema.omit({ outputSchema: true }).array(),
@@ -270,7 +277,6 @@ export const use = serviceUse(Service)
 export const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
-    const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
     const auth = yield* McpAuth.Service
     const bus = yield* Bus.Service
 
@@ -418,10 +424,12 @@ export const layer = Layer.effect(
     ) {
       const [cmd, ...args] = mcp.command
       const cwd = yield* InstanceState.directory
+      const spawnCmd = process.platform !== "win32" ? "setsid" : cmd
+      const spawnArgs: string[] = process.platform !== "win32" ? [cmd, ...args] : args
       const transport = new StdioClientTransport({
         stderr: "pipe",
-        command: cmd,
-        args,
+        command: spawnCmd,
+        args: spawnArgs,
         cwd,
         env: {
           ...process.env,
@@ -435,10 +443,11 @@ export const layer = Layer.effect(
 
       const connectTimeout = mcp.timeout ?? DEFAULT_TIMEOUT
       return yield* connectTransport(transport, connectTimeout).pipe(
-        Effect.map((client): { client: MCPClient | undefined; status: Status } => ({
-          client,
-          status: { status: "connected" },
-        })),
+        Effect.map((client): { client: MCPClient | undefined; status: Status } => {
+          const pid = transport.pid
+          if (typeof pid === "number") localMcpPids.add(pid)
+          return { client, status: { status: "connected" } }
+        }),
         Effect.catch((error): Effect.Effect<{ client: MCPClient | undefined; status: Status }> => {
           const msg = error instanceof Error ? error.message : String(error)
           log.error("local mcp startup failed", { key, command: mcp.command, cwd, error: msg })
@@ -474,30 +483,6 @@ export const layer = Layer.effect(
       return { mcpClient, status, defs: listed } satisfies CreateResult
     })
     const cfgSvc = yield* Config.Service
-
-    const descendants = Effect.fnUntraced(
-      function* (pid: number) {
-        if (process.platform === "win32") return [] as number[]
-        const pids: number[] = []
-        const queue = [pid]
-        while (queue.length > 0) {
-          const current = queue.shift()!
-          const handle = yield* spawner.spawn(ChildProcess.make("pgrep", ["-P", String(current)], { stdin: "ignore" }))
-          const text = yield* Stream.mkString(Stream.decodeText(handle.stdout))
-          yield* handle.exitCode
-          for (const tok of text.split("\n")) {
-            const cpid = parseInt(tok, 10)
-            if (!isNaN(cpid) && !pids.includes(cpid)) {
-              pids.push(cpid)
-              queue.push(cpid)
-            }
-          }
-        }
-        return pids
-      },
-      Effect.scoped,
-      Effect.catch(() => Effect.succeed([] as number[])),
-    )
 
     function watch(s: State, name: string, client: MCPClient, bridge: EffectBridge.Shape, timeout?: number) {
       client.setNotificationHandler(ToolListChangedNotificationSchema, async () => {
@@ -559,14 +544,13 @@ export const layer = Layer.effect(
                 Effect.gen(function* () {
                   const pid = client.transport instanceof StdioClientTransport ? client.transport.pid : null
                   if (typeof pid === "number") {
-                    const pids = yield* descendants(pid)
-                    for (const dpid of pids) {
-                      try {
-                        process.kill(dpid, "SIGTERM")
-                      } catch {}
-                    }
+                    localMcpPids.delete(pid)
+                    try { process.kill(-pid, "SIGTERM") } catch {}
                   }
                   yield* Effect.tryPromise(() => client.close()).pipe(Effect.ignore)
+                  if (typeof pid === "number") {
+                    try { process.kill(-pid, "SIGKILL") } catch {}
+                  }
                 }),
               { concurrency: "unbounded" },
             )
@@ -578,12 +562,20 @@ export const layer = Layer.effect(
       }),
     )
 
-    function closeClient(s: State, name: string) {
+    const closeClient = Effect.fnUntraced(function* (s: State, name: string) {
       const client = s.clients[name]
       delete s.defs[name]
-      if (!client) return Effect.void
-      return Effect.tryPromise(() => client.close()).pipe(Effect.ignore)
-    }
+      if (!client) return
+      const pid = client.transport instanceof StdioClientTransport ? client.transport.pid : null
+      if (typeof pid === "number") {
+        localMcpPids.delete(pid)
+        try { process.kill(-pid, "SIGTERM") } catch {}
+      }
+      yield* Effect.tryPromise(() => client.close()).pipe(Effect.ignore)
+      if (typeof pid === "number") {
+        try { process.kill(-pid, "SIGKILL") } catch {}
+      }
+    })
 
     const storeClient = Effect.fnUntraced(function* (
       s: State,
@@ -954,7 +946,6 @@ export const defaultLayer = layer.pipe(
   Layer.provide(McpAuth.layer),
   Layer.provide(Bus.layer),
   Layer.provide(Config.defaultLayer),
-  Layer.provide(CrossSpawnSpawner.defaultLayer),
   Layer.provide(AppFileSystem.defaultLayer),
 )
 
