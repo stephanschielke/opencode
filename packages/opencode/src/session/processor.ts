@@ -1,5 +1,5 @@
 import { Image } from "@/image/image"
-import { Cause, Deferred, Effect, Exit, Layer, Context, Scope, Schema } from "effect"
+import { Cause, Deferred, Effect, Exit, Layer, Context, Scope, Schema, Schedule } from "effect"
 import * as Stream from "effect/Stream"
 import { Agent } from "@/agent/agent"
 import { Bus } from "@/bus"
@@ -809,35 +809,38 @@ export const layer = Layer.effect(
               (cause) => Effect.fail(Cause.squash(cause)),
             ),
             Effect.retry(
-              SessionRetry.policy({
-                provider: input.model.providerID,
-                parse,
-                set: (info) => {
-                  // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
-                  const event = flags.experimentalEventSystem
-                    ? events.publish(SessionEvent.Retried, {
-                        sessionID: ctx.sessionID,
-                        attempt: info.attempt,
-                        error: {
+              Schedule.take(
+                SessionRetry.policy({
+                  provider: input.model.providerID,
+                  parse,
+                  set: (info) => {
+                    // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
+                    const event = flags.experimentalEventSystem
+                      ? events.publish(SessionEvent.Retried, {
+                          sessionID: ctx.sessionID,
+                          attempt: info.attempt,
+                          error: {
+                            message: info.message,
+                            isRetryable: true,
+                          },
+                          timestamp: DateTime.makeUnsafe(Date.now()),
+                        })
+                      : Effect.void
+                    return event.pipe(
+                      Effect.andThen(
+                        status.set(ctx.sessionID, {
+                          type: "retry",
+                          attempt: info.attempt,
                           message: info.message,
-                          isRetryable: true,
-                        },
-                        timestamp: DateTime.makeUnsafe(Date.now()),
-                      })
-                    : Effect.void
-                  return event.pipe(
-                    Effect.andThen(
-                      status.set(ctx.sessionID, {
-                        type: "retry",
-                        attempt: info.attempt,
-                        message: info.message,
-                        action: info.action,
-                        next: info.next,
-                      }),
-                    ),
-                  )
-                },
-              }),
+                          action: info.action,
+                          next: info.next,
+                        }),
+                      ),
+                    )
+                  },
+                }),
+                5,
+              ),
             ),
             Effect.catch(halt),
             Effect.ensuring(cleanup()),

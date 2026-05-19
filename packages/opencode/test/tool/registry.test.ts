@@ -49,8 +49,7 @@ type RegistryLayerOptions = {
 const registryLayer = (opts: RegistryLayerOptions = {}) =>
   ToolRegistry.layer
     .pipe(
-      Layer.provide(configLayer),
-      Layer.provide(MCP.defaultLayer),
+      Layer.provide(Layer.mergeAll(configLayer, MCP.defaultLayer)),
       Layer.provide(opts.plugin ?? Plugin.defaultLayer),
       Layer.provide(Question.defaultLayer),
       Layer.provide(Todo.defaultLayer),

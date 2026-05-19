@@ -64,11 +64,41 @@ export function delay(attempt: number, error?: MessageV2.APIError) {
   return cap(Math.min(RETRY_INITIAL_DELAY * Math.pow(RETRY_BACKOFF_FACTOR, attempt - 1), RETRY_MAX_DELAY_NO_HEADERS))
 }
 
+// Provider-side credential / auth failures the upstream still flags as
+// `isRetryable: true` but are permanent until an operator fixes the provider.
+// Retrying them just burns CPU and eventually wedges the session.
+//
+// Match against responseBody (lower-cased) — the messages we observed:
+//   - 9router: "No active credentials for provider: <uuid>"
+//   - generic auth: "unauthorized" / "invalid api key" / "missing api key"
+const NON_RETRYABLE_BODY_PATTERNS = [
+  "no active credentials",
+  "invalid api key",
+  "missing api key",
+  "api key not found",
+  "unauthorized",
+  "authentication failed",
+  "invalid_api_key",
+]
+
+function bodyMatchesNonRetryable(body: string | undefined) {
+  if (!body) return false
+  const lower = body.toLowerCase()
+  return NON_RETRYABLE_BODY_PATTERNS.some((pattern) => lower.includes(pattern))
+}
+
 export function retryable(error: Err, provider: string) {
   // context overflow errors should not be retried
   if (MessageV2.ContextOverflowError.isInstance(error)) return undefined
   if (MessageV2.APIError.isInstance(error)) {
     const status = error.data.statusCode
+    // Permanent credential/auth failures should never be retried even when the
+    // upstream provider/router incorrectly flags them as `isRetryable: true`.
+    // Without this guard a misconfigured 9router combo can pin the session in
+    // an infinite retry loop until the process is killed externally.
+    if (bodyMatchesNonRetryable(error.data.responseBody) || bodyMatchesNonRetryable(error.data.message)) {
+      return undefined
+    }
     // 5xx errors are transient server failures and should always be retried,
     // even when the provider SDK doesn't explicitly mark them as retryable.
     if (!error.data.isRetryable && !(status !== undefined && status >= 500)) return undefined
